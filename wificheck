@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# wificheck - notify you when an unstable Wi-Fi connection comes back online
+set -euo pipefail
+
+# ── Config ──────────────────────────────────────────────────────────────────
+DEFAULT_DNS="1.1.1.1"
+PING_TIMEOUT=1            # seconds per ping
+FAILURE_THRESHOLD=3       # consecutive failures before reverse-mode alerts
+FRAME_DELAY=0.12          # animation tick (seconds)
+CANVAS_WIDTH=42           # horizontal flight path for the pigeon
+
+DNS="${WIFICHECK_DNS:-$DEFAULT_DNS}"
+QUIET=false
+REVERSE=false
+STATIC=false
+TIMEOUT_MIN=0             # 0 = no timeout
+
+# ── Colors ──────────────────────────────────────────────────────────────────
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+GREEN='\033[38;5;114m'
+RED='\033[38;5;167m'
+AMBER='\033[38;5;215m'
+WING='\033[38;5;250m'
+BODY='\033[38;5;253m'
+BEAK='\033[38;5;214m'
+EYE='\033[38;5;232m'
+
+# ── Usage ───────────────────────────────────────────────────────────────────
+usage() {
+    cat <<'USAGE'
+wificheck - notify you when an unstable Wi-Fi connection comes back online
+
+Usage:
+    wificheck [options]
+
+Options:
+    -r, --reverse         Watch a live connection; notify when it drops
+    -s, --static          Skip the ASCII animation; show a plain status line
+    -q, --quiet           Suppress the spoken notification (say)
+    -d, --dns <host>      DNS/host to ping (default: 1.1.1.1)
+    -t, --timeout <mins>  Give up after this many minutes (forward mode)
+    -h, --help            Show this help
+
+Environment:
+    WIFICHECK_DNS         Default ping target; overridden by -d/--dns
+
+Forward mode (default): pings until the connection is up.
+    First ping succeeds:  "Internet is working"
+    Later ping succeeds:  "Internet is working again"
+    Timeout reached:      "Internet is not working. Tried for N minutes
+                           to reach <host> without success."
+
+Reverse mode (-r): pings while the connection is up.
+    After 3 consecutive failures: "Internet is not working"
+USAGE
+    exit 0
+}
+
+# ── Parse args ──────────────────────────────────────────────────────────────
+while (( $# )); do
+    case "$1" in
+        -h|--help)    usage ;;
+        -q|--quiet)   QUIET=true; shift ;;
+        -r|--reverse) REVERSE=true; shift ;;
+        -s|--static)  STATIC=true; shift ;;
+        -d|--dns)
+            [[ $# -ge 2 ]] || { echo "Error: $1 requires a value" >&2; exit 1; }
+            DNS="$2"; shift 2 ;;
+        --dns=*)      DNS="${1#*=}"; shift ;;
+        -t|--timeout)
+            [[ $# -ge 2 ]] || { echo "Error: $1 requires a value" >&2; exit 1; }
+            [[ $2 =~ ^[0-9]+$ ]] || { echo "Error: $1 requires a whole number of minutes" >&2; exit 1; }
+            TIMEOUT_MIN="$2"; shift 2 ;;
+        --timeout=*)
+            TIMEOUT_MIN="${1#*=}"
+            [[ $TIMEOUT_MIN =~ ^[0-9]+$ ]] || { echo "Error: --timeout requires a whole number of minutes" >&2; exit 1; }
+            shift ;;
+        --)           shift; break ;;
+        *)            echo "Error: unknown option: $1 (see --help)" >&2; exit 1 ;;
+    esac
+done
+
+# ── Signal handling ─────────────────────────────────────────────────────────
+CANVAS_HEIGHT=6
+IS_TTY=false
+[[ -t 1 ]] && IS_TTY=true
+RECEIVED_SIGNAL=""
+
+cleanup() {
+    local exit_status=$?
+    trap - EXIT INT TERM HUP QUIT
+    if [[ $IS_TTY == true ]]; then
+        tput cnorm 2>/dev/null || true
+        printf '\033[?25h'
+    fi
+    case "$RECEIVED_SIGNAL" in
+        INT)  exit_status=130 ;;
+        TERM) exit_status=143 ;;
+        HUP)  exit_status=129 ;;
+        QUIT) exit_status=131 ;;
+    esac
+    exit "$exit_status"
+}
+trap cleanup EXIT
+trap 'RECEIVED_SIGNAL=INT;  cleanup' INT
+trap 'RECEIVED_SIGNAL=TERM; cleanup' TERM
+trap 'RECEIVED_SIGNAL=HUP;  cleanup' HUP
+trap 'RECEIVED_SIGNAL=QUIT; cleanup' QUIT
+
+# ── Ping ────────────────────────────────────────────────────────────────────
+ping_once() {
+    ping -c 1 -t "$PING_TIMEOUT" "$DNS" &> /dev/null
+}
+
+# ── Announcement ────────────────────────────────────────────────────────────
+announce() {
+    local msg="$1" color="$2" glyph="$3"
+    printf "  %b%s%b %b%b%s%b\n" "$color" "$glyph" "$RESET" "$color" "$BOLD" "$msg" "$RESET"
+    if [[ $QUIET == false ]] && command -v say &>/dev/null; then
+        say "$msg" &
+        disown 2>/dev/null || true
+    fi
+}
+
+# ── Bird frames ─────────────────────────────────────────────────────────────
+# 5 distinct wing positions; body sits on line 2 of the 5-line canvas.
+bird_frame_0=(  # wings high
+    '  \   /'
+    '   \ /'
+    '   (•)>'
+    '       '
+    '       '
+)
+bird_frame_1=(  # wings mid-high
+    '       '
+    '  \_ _/'
+    '   (•)>'
+    '       '
+    '       '
+)
+bird_frame_2=(  # wings flat
+    '       '
+    '       '
+    ' ──(•)>──'
+    '       '
+    '       '
+)
+bird_frame_3=(  # wings mid-low
+    '       '
+    '       '
+    '   (•)>'
+    '  /‾ ‾\'
+    '       '
+)
+bird_frame_4=(  # wings low
+    '       '
+    '       '
+    '   (•)>'
+    '   / \ '
+    '  /   \'
+)
+
+# Ping-pong flap cycle: high → flat → low → flat → high …
+flap_cycle=(0 1 2 3 4 3 2 1)
+
+# ── Perched pigeon frames (reverse mode) ────────────────────────────────────
+# 4-line bird: L0-L1 sky (indicators), L2 head/wings, L3 body.
+# Below the bird we draw a wire (drawn dynamically).
+# Calm state: bird asleep (eye `-`), Zs drift up.
+perch_calm_0=(
+    '                '
+    '                '
+    '      __        '
+    '     (-)>       '
+)
+perch_calm_1=(
+    '                '
+    '         z      '
+    '      __        '
+    '     (-)>       '
+)
+perch_calm_2=(
+    '          Z     '
+    '        z       '
+    '      __        '
+    '     (-)>       '
+)
+perch_calm_3=(
+    '           z    '
+    '                '
+    '      __        '
+    '     (-)>       '
+)
+# Alert state: bird awake (eye `•`), `?` floats up.
+perch_alert_0=(
+    '                '
+    '        ?       '
+    '      __        '
+    '     (•)>       '
+)
+perch_alert_1=(
+    '        ?       '
+    '                '
+    '      __        '
+    '     (•)>       '
+)
+# Alarm state: bird spreads wings, `!` floats up.
+perch_alarm_0=(
+    '                '
+    '       !        '
+    '   \_  _/       '
+    '     (O)<       '
+)
+perch_alarm_1=(
+    '       !        '
+    '                '
+    '    _   _       '
+    '   / (O)<\      '
+)
+
+PERCH_WIRE_WIDTH=32
+PERCH_ATTACH_COL=6   # column of ╪ (below the eye)
+PERCH_HOLD=4         # ticks per perch variant (slows the cycle)
+
+# ── Draw ────────────────────────────────────────────────────────────────────
+draw_frame() {
+    local tick="$1" mode="$2" elapsed="$3" failures="${4:-0}"
+    local frame_idx=${flap_cycle[$(( tick % ${#flap_cycle[@]} ))]}
+    local x_pos=$(( tick % (CANVAS_WIDTH + 1) ))
+
+    local frame_ref="bird_frame_${frame_idx}[@]"
+    local lines=("${!frame_ref}")
+
+    if [[ $IS_TTY == true ]]; then
+        printf '\033[%dA' "$CANVAS_HEIGHT"
+    fi
+
+    local i line before after
+    for (( i = 0; i < 5; i++ )); do
+        [[ $IS_TTY == true ]] && printf '\033[2K'
+        line="${lines[$i]}"
+        printf '%*s' "$x_pos" ""
+        if (( i == 2 )); then
+            before="${line%%(•)>*}"
+            after="${line#*(•)>}"
+            printf "${WING}%s${RESET}${BODY}(${EYE}•${BODY})${BEAK}>${RESET}${WING}%s${RESET}\n" \
+                "$before" "$after"
+        else
+            printf "${WING}%s${RESET}\n" "$line"
+        fi
+    done
+
+    [[ $IS_TTY == true ]] && printf '\033[2K'
+    case "$mode" in
+        waiting)
+            printf "  ${RED}●${RESET} ${DIM}Wi-Fi down — waiting on carrier pigeon… (%ds)${RESET}\n" \
+                "$elapsed"
+            ;;
+        watching)
+            if (( failures > 0 )); then
+                printf "  ${AMBER}●${RESET} ${DIM}Watching connection… (%ds, %d/%d dropped)${RESET}\n" \
+                    "$elapsed" "$failures" "$FAILURE_THRESHOLD"
+            else
+                printf "  ${GREEN}●${RESET} ${DIM}Watching connection… (%ds)${RESET}\n" "$elapsed"
+            fi
+            ;;
+    esac
+}
+
+draw_wire() {
+    local failures="$1" tick="$2"
+    local out="" i wob_every=0
+    case "$failures" in
+        0) wob_every=0 ;;
+        1) wob_every=8 ;;
+        *) wob_every=4 ;;
+    esac
+    for (( i = 0; i < PERCH_WIRE_WIDTH; i++ )); do
+        if (( i == PERCH_ATTACH_COL )); then
+            out+="╪"
+        elif (( wob_every > 0 )) && (( (i + tick) % wob_every == 0 )); then
+            out+="∿"
+        else
+            out+="═"
+        fi
+    done
+    [[ $IS_TTY == true ]] && printf '\033[2K'
+    if (( failures >= 2 )); then
+        printf "${AMBER}%s${RESET}\n" "$out"
+    else
+        printf "${DIM}${WING}%s${RESET}\n" "$out"
+    fi
+}
+
+draw_perch() {
+    local tick="$1" failures="$2" elapsed="$3"
+    local state variant indicator_color variants
+    if (( failures == 0 )); then
+        state=calm; variants=4; indicator_color="${DIM}${WING}"
+    elif (( failures == 1 )); then
+        state=alert; variants=2; indicator_color="$AMBER"
+    else
+        state=alarm; variants=2; indicator_color="$RED"
+    fi
+    variant=$(( (tick / PERCH_HOLD) % variants ))
+    local frame_ref="perch_${state}_${variant}[@]"
+    local lines=("${!frame_ref}")
+
+    if [[ $IS_TTY == true ]]; then
+        printf '\033[%dA' "$CANVAS_HEIGHT"
+    fi
+
+    local i line before after eye
+    for (( i = 0; i < 4; i++ )); do
+        [[ $IS_TTY == true ]] && printf '\033[2K'
+        line="${lines[$i]}"
+        case "$i" in
+            0|1)
+                printf "${indicator_color}%s${RESET}\n" "$line"
+                ;;
+            2)
+                printf "${WING}%s${RESET}\n" "$line"
+                ;;
+            3)
+                local dir=">"
+                case "$line" in
+                    *"(•)>"*) eye="•"; before="${line%%(•)>*}"; after="${line#*(•)>}" ;;
+                    *"(-)>"*) eye="-"; before="${line%%(-)>*}"; after="${line#*(-)>}" ;;
+                    *"(O)>"*) eye="O"; before="${line%%(O)>*}"; after="${line#*(O)>}" ;;
+                    *"(•)<"*) eye="•"; dir="<"; before="${line%%(•)<*}"; after="${line#*(•)<}" ;;
+                    *"(-)<"*) eye="-"; dir="<"; before="${line%%(-)<*}"; after="${line#*(-)<}" ;;
+                    *"(O)<"*) eye="O"; dir="<"; before="${line%%(O)<*}"; after="${line#*(O)<}" ;;
+                esac
+                printf "${WING}%s${RESET}${BODY}(${EYE}${eye}${BODY})${BEAK}${dir}${RESET}${WING}%s${RESET}\n" \
+                    "$before" "$after"
+                ;;
+        esac
+    done
+
+    draw_wire "$failures" "$tick"
+
+    [[ $IS_TTY == true ]] && printf '\033[2K'
+    if (( failures > 0 )); then
+        printf "  ${AMBER}●${RESET} ${DIM}Watching connection… (%ds, %d/%d dropped)${RESET}\n" \
+            "$elapsed" "$failures" "$FAILURE_THRESHOLD"
+    else
+        printf "  ${GREEN}●${RESET} ${DIM}Watching connection… (%ds)${RESET}\n" "$elapsed"
+    fi
+}
+
+reserve_canvas() {
+    local i
+    for (( i = 0; i < CANVAS_HEIGHT; i++ )); do
+        echo ""
+    done
+}
+
+clear_canvas() {
+    if [[ $IS_TTY == true ]]; then
+        printf '\033[%dA' "$CANVAS_HEIGHT"
+        local i
+        for (( i = 0; i < CANVAS_HEIGHT; i++ )); do
+            printf '\033[2K\n'
+        done
+        printf '\033[%dA' "$CANVAS_HEIGHT"
+    fi
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+if [[ $IS_TTY == true ]]; then
+    tput civis 2>/dev/null || true
+fi
+
+SECONDS=0
+tick=0
+
+if [[ $REVERSE == false ]]; then
+    # Fast path: first ping succeeds immediately
+    if ping_once; then
+        announce "Internet is working" "$GREEN" "✓"
+        exit 0
+    fi
+
+    timed_out=false
+    timeout_sec=$(( TIMEOUT_MIN * 60 ))
+    if [[ $STATIC == true ]]; then
+        while ! ping_once; do
+            if (( TIMEOUT_MIN > 0 && SECONDS >= timeout_sec )); then
+                timed_out=true
+                break
+            fi
+            if [[ $IS_TTY == true ]]; then
+                printf "\r\033[2K  ${RED}●${RESET} ${DIM}Wi-Fi down — waiting… (%ds)${RESET}" "$SECONDS"
+            fi
+            sleep 1
+        done
+        [[ $IS_TTY == true ]] && printf "\r\033[2K"
+    else
+        reserve_canvas
+        while ! ping_once; do
+            if (( TIMEOUT_MIN > 0 && SECONDS >= timeout_sec )); then
+                timed_out=true
+                break
+            fi
+            draw_frame "$tick" waiting "$SECONDS"
+            sleep "$FRAME_DELAY"
+            tick=$((tick + 1))
+        done
+        clear_canvas
+    fi
+    if [[ $timed_out == true ]]; then
+        unit="minutes"; (( TIMEOUT_MIN == 1 )) && unit="minute"
+        announce "Internet is not working. Tried for ${TIMEOUT_MIN} ${unit} to reach ${DNS} without success." "$RED" "✗"
+        exit 1
+    fi
+    announce "Internet is working again" "$GREEN" "✓"
+else
+    failures=0
+    if [[ $STATIC == true ]]; then
+        while (( failures < FAILURE_THRESHOLD )); do
+            if ping_once; then
+                failures=0
+            else
+                failures=$((failures + 1))
+            fi
+            if [[ $IS_TTY == true ]]; then
+                if (( failures > 0 )); then
+                    printf "\r\033[2K  ${AMBER}●${RESET} ${DIM}Watching connection… (%ds, %d/%d dropped)${RESET}" \
+                        "$SECONDS" "$failures" "$FAILURE_THRESHOLD"
+                else
+                    printf "\r\033[2K  ${GREEN}●${RESET} ${DIM}Watching connection… (%ds)${RESET}" "$SECONDS"
+                fi
+            fi
+            sleep 1
+        done
+        [[ $IS_TTY == true ]] && printf "\r\033[2K"
+    else
+        # Animate while a ping runs in the background so the perched
+        # pigeon keeps moving between ping attempts.
+        reserve_canvas
+        while (( failures < FAILURE_THRESHOLD )); do
+            ping -c 1 -t "$PING_TIMEOUT" "$DNS" &> /dev/null &
+            PING_PID=$!
+            while kill -0 "$PING_PID" 2>/dev/null; do
+                draw_perch "$tick" "$failures" "$SECONDS"
+                sleep "$FRAME_DELAY"
+                tick=$((tick + 1))
+            done
+            if wait "$PING_PID" 2>/dev/null; then
+                failures=0
+            else
+                failures=$((failures + 1))
+            fi
+            PING_PID=""
+        done
+        clear_canvas
+    fi
+    announce "Internet is not working" "$RED" "✗"
+fi
