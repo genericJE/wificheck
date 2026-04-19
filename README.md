@@ -34,6 +34,7 @@ wificheck -q                 # quiet (no `say`)
 wificheck -s                 # static; skip the animation, plain status line
 wificheck -d 8.8.8.8         # ping a different host
 wificheck -t 5               # give up after 5 minutes
+wificheck -i 5               # ping every 5 seconds (default: 1)
 ```
 
 ### Options
@@ -45,6 +46,7 @@ wificheck -t 5               # give up after 5 minutes
 | `-q`, `--quiet` | Suppress the spoken notification (`say`) |
 | `-d`, `--dns <host>` | DNS/host to ping (default: `1.1.1.1`) |
 | `-t`, `--timeout <mins>` | Give up after this many minutes (forward mode) |
+| `-i`, `--interval <secs>` | Seconds between ping attempts (default: `1`) |
 | `-h`, `--help` | Show help |
 
 ### Environment

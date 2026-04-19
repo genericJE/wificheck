@@ -15,6 +15,7 @@ REVERSE=false
 STATIC=false
 TIMEOUT_MIN=0
 TIMEOUT_SET=false         # set true when -t/--timeout is passed
+INTERVAL=1                # seconds between ping attempts
 
 # ── Colors ──────────────────────────────────────────────────────────────────
 RESET='\033[0m'
@@ -42,6 +43,7 @@ Options:
     -q, --quiet           Suppress the spoken notification (say)
     -d, --dns <host>      DNS/host to ping (default: 1.1.1.1)
     -t, --timeout <mins>  Give up after this many minutes (forward mode)
+    -i, --interval <secs> Seconds between ping attempts (default: 1)
     -h, --help            Show this help
 
 Environment:
@@ -78,37 +80,59 @@ while (( $# )); do
             TIMEOUT_MIN="${1#*=}"
             [[ $TIMEOUT_MIN =~ ^[0-9]+$ ]] || { echo "Error: --timeout requires a whole number of minutes" >&2; exit 1; }
             TIMEOUT_SET=true; shift ;;
+        -i|--interval)
+            [[ $# -ge 2 ]] || { echo "Error: $1 requires a value" >&2; exit 1; }
+            { [[ $2 =~ ^[0-9]+$ ]] && (( $2 >= 1 )); } || { echo "Error: $1 requires a positive integer (seconds)" >&2; exit 1; }
+            INTERVAL="$2"; shift 2 ;;
+        --interval=*)
+            INTERVAL="${1#*=}"
+            { [[ $INTERVAL =~ ^[0-9]+$ ]] && (( INTERVAL >= 1 )); } || { echo "Error: --interval requires a positive integer (seconds)" >&2; exit 1; }
+            shift ;;
         --)           shift; break ;;
         *)            echo "Error: unknown option: $1 (see --help)" >&2; exit 1 ;;
     esac
 done
 
 # ── Signal handling ─────────────────────────────────────────────────────────
+# Note: no EXIT trap. Bash prints stray "wait_for: No record of process" warnings
+# to stderr when an EXIT trap coexists with multiple child processes, even when
+# each wait is redirected. Signal traps alone avoid this, so we use an explicit
+# finish() helper at every exit point instead.
 CANVAS_HEIGHT=6
 IS_TTY=false
 [[ -t 1 ]] && IS_TTY=true
-RECEIVED_SIGNAL=""
+PING_PID=""
 
-cleanup() {
-    local exit_status=$?
-    trap - EXIT INT TERM HUP QUIT
+restore_tty() {
     if [[ $IS_TTY == true ]]; then
         tput cnorm 2>/dev/null || true
         printf '\033[?25h'
     fi
-    case "$RECEIVED_SIGNAL" in
-        INT)  exit_status=130 ;;
-        TERM) exit_status=143 ;;
-        HUP)  exit_status=129 ;;
-        QUIT) exit_status=131 ;;
-    esac
-    exit "$exit_status"
 }
-trap cleanup EXIT
-trap 'RECEIVED_SIGNAL=INT;  cleanup' INT
-trap 'RECEIVED_SIGNAL=TERM; cleanup' TERM
-trap 'RECEIVED_SIGNAL=HUP;  cleanup' HUP
-trap 'RECEIVED_SIGNAL=QUIT; cleanup' QUIT
+
+kill_ping() {
+    if [[ -n "$PING_PID" ]] && kill -0 "$PING_PID" 2>/dev/null; then
+        kill "$PING_PID" 2>/dev/null || true
+    fi
+    PING_PID=""
+}
+
+finish() {
+    local rc="${1:-0}"
+    kill_ping
+    restore_tty
+    exit "$rc"
+}
+
+on_signal() {
+    local rc="$1"
+    trap - INT TERM HUP QUIT
+    finish "$rc"
+}
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+trap 'on_signal 129' HUP
+trap 'on_signal 131' QUIT
 
 # ── Ping ────────────────────────────────────────────────────────────────────
 ping_once() {
@@ -381,7 +405,7 @@ if [[ $REVERSE == false ]]; then
     # Fast path: first ping succeeds immediately
     if ping_once; then
         announce "Internet is working" "$GREEN" "✓"
-        exit 0
+        finish 0
     fi
 
     timed_out=false
@@ -395,28 +419,58 @@ if [[ $REVERSE == false ]]; then
             if [[ $IS_TTY == true ]]; then
                 printf "\r\033[2K  ${RED}●${RESET} ${DIM}Wi-Fi down — waiting… (%ds)${RESET}" "$SECONDS"
             fi
-            sleep 1
+            sleep "$INTERVAL"
         done
         [[ $IS_TTY == true ]] && printf "\r\033[2K"
     else
+        # Animate while a ping runs in the background so the frame rate and
+        # elapsed counter stay smooth even when a ping takes seconds to fail.
         reserve_canvas
-        while ! ping_once; do
+        while true; do
+            ping -c 1 -t "$PING_TIMEOUT" "$DNS" &> /dev/null &
+            PING_PID=$!
+            while kill -0 "$PING_PID" 2>/dev/null; do
+                if [[ $TIMEOUT_SET == true ]] && (( SECONDS >= timeout_sec )); then
+                    kill "$PING_PID" 2>/dev/null || true
+                    wait "$PING_PID" 2>/dev/null || true
+                    PING_PID=""
+                    timed_out=true
+                    break 2
+                fi
+                draw_frame "$tick" waiting "$SECONDS"
+                sleep "$FRAME_DELAY"
+                tick=$((tick + 1))
+            done
+            if wait "$PING_PID" 2>/dev/null; then
+                PING_PID=""
+                break
+            fi
+            PING_PID=""
             if [[ $TIMEOUT_SET == true ]] && (( SECONDS >= timeout_sec )); then
                 timed_out=true
                 break
             fi
-            draw_frame "$tick" waiting "$SECONDS"
-            sleep "$FRAME_DELAY"
-            tick=$((tick + 1))
+            # Pace: animate through the inter-ping pause.
+            pace_start=$SECONDS
+            while (( SECONDS - pace_start < INTERVAL )); do
+                if [[ $TIMEOUT_SET == true ]] && (( SECONDS >= timeout_sec )); then
+                    timed_out=true
+                    break 2
+                fi
+                draw_frame "$tick" waiting "$SECONDS"
+                sleep "$FRAME_DELAY"
+                tick=$((tick + 1))
+            done
         done
         clear_canvas
     fi
     if [[ $timed_out == true ]]; then
         unit="minutes"; (( TIMEOUT_MIN == 1 )) && unit="minute"
         announce "Internet is not working. Tried for ${TIMEOUT_MIN} ${unit} to reach ${DNS} without success." "$RED" "✗"
-        exit 1
+        finish 1
     fi
     announce "Internet is working again" "$GREEN" "✓"
+    finish 0
 else
     failures=0
     if [[ $STATIC == true ]]; then
@@ -434,7 +488,7 @@ else
                     printf "\r\033[2K  ${GREEN}●${RESET} ${DIM}Watching connection… (%ds)${RESET}" "$SECONDS"
                 fi
             fi
-            sleep 1
+            sleep "$INTERVAL"
         done
         [[ $IS_TTY == true ]] && printf "\r\033[2K"
     else
@@ -455,8 +509,18 @@ else
                 failures=$((failures + 1))
             fi
             PING_PID=""
+            if (( failures < FAILURE_THRESHOLD )); then
+                # Pace: animate through the inter-ping pause.
+                pace_start=$SECONDS
+                while (( SECONDS - pace_start < INTERVAL )); do
+                    draw_perch "$tick" "$failures" "$SECONDS"
+                    sleep "$FRAME_DELAY"
+                    tick=$((tick + 1))
+                done
+            fi
         done
         clear_canvas
     fi
     announce "Internet is not working" "$RED" "✗"
+    finish 1
 fi
