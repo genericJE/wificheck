@@ -13,7 +13,8 @@ DNS="${WIFICHECK_DNS:-$DEFAULT_DNS}"
 QUIET=false
 REVERSE=false
 STATIC=false
-TIMEOUT_MIN=0             # 0 = no timeout
+TIMEOUT_MIN=0
+TIMEOUT_SET=false         # set true when -t/--timeout is passed
 
 # ── Colors ──────────────────────────────────────────────────────────────────
 RESET='\033[0m'
@@ -72,11 +73,11 @@ while (( $# )); do
         -t|--timeout)
             [[ $# -ge 2 ]] || { echo "Error: $1 requires a value" >&2; exit 1; }
             [[ $2 =~ ^[0-9]+$ ]] || { echo "Error: $1 requires a whole number of minutes" >&2; exit 1; }
-            TIMEOUT_MIN="$2"; shift 2 ;;
+            TIMEOUT_MIN="$2"; TIMEOUT_SET=true; shift 2 ;;
         --timeout=*)
             TIMEOUT_MIN="${1#*=}"
             [[ $TIMEOUT_MIN =~ ^[0-9]+$ ]] || { echo "Error: --timeout requires a whole number of minutes" >&2; exit 1; }
-            shift ;;
+            TIMEOUT_SET=true; shift ;;
         --)           shift; break ;;
         *)            echo "Error: unknown option: $1 (see --help)" >&2; exit 1 ;;
     esac
@@ -387,7 +388,7 @@ if [[ $REVERSE == false ]]; then
     timeout_sec=$(( TIMEOUT_MIN * 60 ))
     if [[ $STATIC == true ]]; then
         while ! ping_once; do
-            if (( TIMEOUT_MIN > 0 && SECONDS >= timeout_sec )); then
+            if [[ $TIMEOUT_SET == true ]] && (( SECONDS >= timeout_sec )); then
                 timed_out=true
                 break
             fi
@@ -400,7 +401,7 @@ if [[ $REVERSE == false ]]; then
     else
         reserve_canvas
         while ! ping_once; do
-            if (( TIMEOUT_MIN > 0 && SECONDS >= timeout_sec )); then
+            if [[ $TIMEOUT_SET == true ]] && (( SECONDS >= timeout_sec )); then
                 timed_out=true
                 break
             fi
