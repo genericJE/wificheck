@@ -34,6 +34,10 @@ wificheck -t 5               # give up after 5 minutes
 wificheck -i 5               # ping every 5 seconds (default: 1)
 ```
 
+<p align="center">
+  <img src="wifi-reverse.gif" alt="wificheck reverse mode watching for drops" width="606">
+</p>
+
 ### Options
 
 | Flag | Description |
