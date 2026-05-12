@@ -3,12 +3,9 @@
 A tool to notify you when an unstable Wi-Fi connection comes back online.
 Inspired by flakey cafe internet connections <3
 
-```
-  \   /
-   \ /
-   (•)>
-  ● Wi-Fi down — waiting on carrier pigeon… (7s)
-```
+<p align="center">
+  <img src="wifi.gif" alt="wificheck carrier pigeon animation" width="734">
+</p>
 
 ## Install
 
